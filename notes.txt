@@ -1,0 +1,158 @@
+What if we can make a React-ish UI library that runs inside a WebAssembly VM ?
+This will unlock a world of possibilities. My personal favourite is making the UI portable across a wide variety of platforms. Like, server-side rendering without the headache of scaling nodejs servers. Or, writing cross platform UI code that powers both iOS and Android!
+
+1 - 02 - 2022
+What language should I pick? Obviously, I want a language that supports succinct definition of these UI trees. A language that supports classes, custom types and most importantly a really convenient way to make a tree of instances/literals out of my UI node types. 
+
+For example in JSX I can just write <MyButton onclick="callSomething" class="my-class"> Submit </MyButton> and what it really means is, roughly:
+
+React.createElement({ // creates an instance of MyButton class
+    component: MyButton,
+    attrs: {
+        class
+        onclick: "callSomething"
+    }
+    children: ["Submit"]
+})
+
+This kind of convenience is needed for my UI Node types to implement a render function that returns a tree of UI node instances without forcing the devs to write a ton of boilerplate.
+
+After a bit of dabbling with Rust and accepting my incompetence with its custom types, I decided it's time to look for other options. Also, I believe Rust's borrowing memory model will likely make traversing and mutating tree-like structures a horrible experience. At least I don't have enough expertise to hop around Rust's strictness in heap management. It's unfortunate because if I go with Rust, the wasm size would have been really really small. I'll probably be exploring Kotlin next.
+
+2-02-2022 
+So I'm choosing Kotlin for now. Why Kotlin? as far as I know the team behind Kotlin focuses on "interoperability" with existing ecosystems, as a their prime strategy, which is great! They really care about making Kotlin apps run in a bunch of environments. Look at projects like Jetpack Compose, Compose Desktop and KotlinJS - they all show Jetpack's commitment in making the language truly cross platform. 
+
+However, the WASM story of Kotlin is a bit tricky. They are yet to support WebAssembly as a direct compilation target, but there's an unorthodox alternative route: Use Kotlin/Native to generate LLVM and then get to WASM from LLVM. They even had a (now declared as deprecated) inbuilt support in kotlin-native compiler to turn your code into a wasm module using this route. 
+
+Speaking about compilers, do you know what I'm about to build is a lot like a compiler. It's going to take the developer's definition of UI tree hierarchy and compile it down into a string of HTML that the browser can understand. It's like taking the AST of source code, processing that tree and turning it into processor instructions. Just a bit easier, because I'll be iterating a tree of higher order types (custom elements) and recursively expand them into, what I call bottom types (i.e native DOM elements). This way the developer gets to write higher order elements that stay close to their business domain and the compiler takes care of compiling them into native DOM types, closer to the machine! 
+
+You never thought of React as a compiler, did you? :)
+
+
+03-02-2022
+
+I still don't have a good enough plan on how I'm about to acheive this. So let's break down the problem into smaller steps:
+
+1. Find a way in Kotlin to define custom UI Nodes and it's render method as a function of it's state.
+2. Decide on a way to define the tree hierarchy itself i.e contents of the render function of a Node. 
+3. Once both of those take a shape we could write a renderTreeToHTML() function (basically the compiler)
+4. Then comes the difficult part of handling events and tree updates when state changes.
+5. For now I'm not going to implement a virtual DOM. I could just flush & re-render the full subtree that needs change. I can plug-in a virtual dom based patching mechanism, later sometime.
+6. I'll worry about proxying events and UI patches back and forth between the WASM vm and the rendering environment later after I successfully get to step 3. 
+
+
+04-02-2022
+
+I'll go ahead and call my library "Kwasm" for no reason other than it kind of rhymes with Awesome ;) So here's a sample UI definition in Kotlin:
+
+class MyButton(props) {
+
+    this.eventMap = mergeMap(
+        mapOf(".inc click", props.onClick)
+    )
+
+    fun render() {
+        return createElement('button', className="inc", attributes={}, children=listOf(["increment"]))
+    }
+}
+
+class MyCounterApp(val count: Int) : Kwasm.Component {
+    this.state = count
+
+    fun onIncrement() {
+        this.setState(count++); // will call render again with new state
+    }
+
+    fun onDecrement() {
+        this.setState(count--); // will call render again with new state
+    }
+
+    fun render() {
+        return Kwasm.createElement('div', className="container", attributes={}, children=listOf([ 
+            Kwasm.createElement(MyButton, onClick=this.onIncrement),
+            Kwasm.createElement('div', className="count-display", children=listOf([""+count])),
+            Kwasm.createElement(MyButton, onClick=this.onDecrement)
+        ]))
+    }
+} 
+
+Let's reverse engineer what we need to build, from here. It's kind of like React, but in Kotlin. Everytime a setState is called, the component calls render() which keeps the UI in sync with the state. 
+
+This was the easy part. The hard part is writing a renderer that takes a root component and expands it into native elements. And the even harder part is syncing this structure with the rendering environment (JS land) . And the hardest part is keeping track of elements between the two environments and proxying events between both of those. But let's worry about the harder parts later and start with the easy one. 
+
+
+04-02-2022 - after a while
+
+OK, I found something interesting. Rust has something called wasm-bindgen, that makes interoperability between webassembly (rust) and JS - really really convenient. Like, I can write DOM manipulation code in Rust and it somehows converts them into numbers (commands) for the JS land to understand. I have to custom-tailor one such layer for Kwasm. It sucks to know that if I go with Rust, this wrapper comes for free.
+
+
+05-02-2022
+For now, I'm not going to do low level DOM manipulations in Kotlin. Every mutation to the state, will send a command to re-render a segment of the DOM tree identified by a (auto-generated) id. And this should be relatively simple. So, I'll stick to Kotlin and see if I hit any walls.
+
+......
+Kotlin lets me store functions in HashMaps, pass them around and invoke them dynamically. Very handy for me to pass callbacks from a parent component to a child. So, yay!
+......
+
+06-02-2022
+I was able to come up with a rudimentary tree declaration API for defining UI components. Right now it's just a low-budget jetpack compose. The API looks concise enough for the POC but leaves much to be desired. The end goal is to allow devs to define their UI structures in Compose itself. If you think about it, Jetpack Compose is just an amazingly convenient tree construction API!
+
+Here's a sample:
+```
+class MyApp(
+    props: Props, // properties passed down from a parent
+    eventCallbacks: HashMap<String, () -> Unit>?, // a collection of callbacks passed down from the parent
+    children: MutableList<Node> // a collection of child nodes
+) : Component(props, eventCallbacks, children) {
+
+    var count = 0
+
+    fun inc() {
+        stateChange { // a way to tell that the state is mutated and this component has to re-render
+            count++
+        }
+    }
+
+    fun dec() {
+        stateChange {
+            count--
+        }
+    }
+
+    override fun render() : Node {
+        // this is how easy(or hard :)) it is to declare our UI tree
+        return k("div", hashMapOf("class" to "container"), mutableListOf(
+
+            // increment button | custom component
+            MyButton(null, hashMapOf("inc" to this::inc ), mutableListOf(k("increment"))),
+            
+            // count display | dom node
+            k("div", hashMapOf("class" to "count"), mutableListOf(k("count: $count"))),
+            
+            // decrement button | custom component
+            MyButton(null, hashMapOf("inc" to this::dec ), mutableListOf(k("decrement")))
+        
+        ))
+    }
+
+}
+
+// custom component for rendering a button
+class MyButton(
+    props: Props?,
+    eventCallbacks: HashMap<String, () -> Unit>?,
+    children: MutableList<Node>
+) : Component(props, eventCallbacks, children) {
+
+    override fun render() : Node {
+        return k("div", children)
+    }
+}
+```
+
+
+15-02-2022
+
+OK. So I'm a father now. Just had a little baby boy on the 9th of Feb. I had a couple of hours to spare so I wrote a recursive node expander that goes through the tree of nodes and expands them to their bottom types i.e call render() functions of custom components and return a clean DOM tree. You can imagine a dead simple version of `React.renderToString()`.
+
+Looks neat. I like how easy it is with Kotlin to check if an object is an instance of a derived class and maybe caste them into the derived class. Quick and intuitive. I'm still surprised at how tiny the actual library code is, up until this point :)
+
